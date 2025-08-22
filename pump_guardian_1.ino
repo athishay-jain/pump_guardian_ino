@@ -1,7 +1,7 @@
 /******************************************************************************
- * PUMGUARD - ESP32 Smart Pump Controller
+ * PUMPGUARDIAN - ESP32 Smart Pump Controller
  *
- * Author: Athishay Jain (with Gemini AI)
+ * Author: Athishay Jain 
  * Date: August 22, 2025
  *
  * Full-featured code for the Pumguard project. This code is designed to be
