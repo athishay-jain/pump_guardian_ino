@@ -33,7 +33,7 @@ LiquidCrystal_I2C lcd(0x27, 16, 2);
 
 // ## 3. FIREBASE CONFIGURATION (FIRESTORE) ##
 //-----------------------------------------------------------------------------
-#define FIREBASE_API_KEY "YOUR_FIREBASE_WEB_API_KEY"
+#define FIREBASE_API_KEY "YAIzaSyB3Kdp7Fk-xrzC4mkm1WcYm31epXi2459M"
 #define FIREBASE_PROJECT_ID "pump-guardian" // Your Project ID
 
 FirebaseData fbdo;
