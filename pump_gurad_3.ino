@@ -64,10 +64,10 @@ const long GMT_OFFSET = 19800;  // +05:30 IST in seconds
 const int DST_OFFSET = 0;
 
 // --- Pins ---
-#define RELAY_PIN 23           // GPIO to drive relay IN
+#define RELAY_PIN 28           // GPIO to drive relay IN
 #define RELAY_ACTIVE_LOW true  // set false if your relay board is active HIGH
-#define START_BTN_PIN 12       // Manual ON button (to GND, uses pull-up)
-#define STOP_BTN_PIN 14        // Manual OFF button (to GND, uses pull-up)
+#define START_BTN_PIN 32       // Manual ON button (to GND, uses pull-up)
+#define STOP_BTN_PIN 33        // Manual OFF button (to GND, uses pull-up)
 #define PZEM_RX_PIN 26         // ESP32 RX2 (to PZEM TX)
 #define PZEM_TX_PIN 25         // ESP32 TX2 (to PZEM RX)
 
