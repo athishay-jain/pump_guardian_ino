@@ -1,354 +1,415 @@
-/******************************************************************************
- * PUMPGUARDIAN - ESP32 Smart Pump Controller
- *
- * Author: Athishay Jain 
- * Date: August 22, 2025
- *
- * Full-featured code for the Pumguard project. This code is designed to be
- * robust, with non-blocking logic and real-time cloud synchronization.
- ******************************************************************************/
-
-// ## 1. LIBRARIES ##
-//-----------------------------------------------------------------------------
-#include <WiFi.h>
-#include <WiFiManager.h>
-#include <PZEM004Tv30.h>
 #include <Wire.h>
 #include <LiquidCrystal_I2C.h>
-#include <Preferences.h>
-#include <ArduinoOTA.h>
-#include "time.h"
-#include <Firebase_ESP_Client.h>
+#include <PZEM004Tv30.h>
 
-// ## 2. HARDWARE & PIN DEFINITIONS ##
-//-----------------------------------------------------------------------------
-#define RELAY_PIN 23
-#define START_BUTTON_PIN 18
-#define STOP_BUTTON_PIN 19
-#define PZEM_RX_PIN 16
-#define PZEM_TX_PIN 17
+// Pin definitions
+const int PZEM_RX_PIN = 26;
+const int PZEM_TX_PIN = 25;
+const int RELAY_PIN = 13;
+const int BTN_START_PIN = 32;
+const int BTN_STOP_PIN = 33;
+const int BUZZER_PIN = 14;
 
-PZEM004Tv30 pzem(Serial2, PZEM_RX_PIN, PZEM_TX_PIN);
+// LCD and PZEM objects
 LiquidCrystal_I2C lcd(0x27, 16, 2);
+PZEM004Tv30 pzem(Serial2, PZEM_RX_PIN, PZEM_TX_PIN);
 
-// ## 3. FIREBASE CONFIGURATION ##
-//-----------------------------------------------------------------------------
-#define FIREBASE_API_KEY "YOUR_FIREBASE_WEB_API_KEY"
-#define FIREBASE_PROJECT_ID "YOUR_FIREBASE_PROJECT_ID" // "pumguard-1234"
-#define FIREBASE_DATABASE_URL "YOUR_FIREBASE_DATABASE_URL" // "pumguard-1234.firebaseio.com" or "pumguard-1234-default-rtdb.firebaseio.com"
-#define FIREBASE_USER_EMAIL "YOUR_FIREBASE_AUTH_EMAIL"
-#define FIREBASE_USER_PASSWORD "YOUR_FIREBASE_AUTH_PASSWORD"
+// --- Advanced Dry Run Settings ---
+// Based on analysis, a dry run shows a significant drop in BOTH Power and Power Factor.
+// We will set the threshold for a 10% drop in Power and a 5% drop in Power Factor from the baseline.
+const float POWER_DROP_THRESHOLD = 0.96;  // Trigger if Power drops below 90% of normal
+const float PF_DROP_THRESHOLD = 0.95;     // Trigger if Power Factor drops below 95% of normal
 
-FirebaseData fbdo;
-FirebaseAuth auth;
-FirebaseConfig config;
+const unsigned long STABILIZATION_DELAY = 7000;   // Wait 7s after start to establish a stable baseline
+const unsigned long DRY_RUN_CONFIRM_TIME = 3000;  // Confirm if low power/pf persists for 3s
+const int MAX_DRY_RUN_ATTEMPTS = 30;
 
-// ## 4. GLOBAL VARIABLES ##
-//-----------------------------------------------------------------------------
-Preferences preferences;
+// --- Sanity Check Thresholds (NEW) ---
+// If the pump starts and the baseline power is already below this value,
+// it's likely starting in a dry state. Prevents setting a bad baseline.
+const float MIN_NORMAL_POWER = 135; // Based on user data (Normal: ~223W, Dry: ~191W) 140//
 
-// Pump state
-bool pumpStatus = false;
-String faultReason = "None";
+// Variables
+bool pumpRunning = false;
+bool permanentLockout = false;
+int dryRunAttempts = 0;
+unsigned long pumpStartTime = 0;
+unsigned long dryRunDetectTime = 0; // Timer for confirming a dry run condition
+unsigned long lastUpdate = 0;
+const unsigned long UPDATE_INTERVAL = 2000;
 
-// Sensor readings
-float voltage = 0.0, current = 0.0, power = 0.0, powerFactor = 0.0;
+// Adaptive Baseline Variables (NEW)
+float refPower = 0.0;     // Reference Active Power (W) established after stabilization
+float refPF = 0.0;        // Reference Power Factor established after stabilization
+float lastPowerRatio = 1.0;
+float lastPfRatio = 1.0;
 
-// Protection thresholds
-float overloadCurrent = 10.0, dryRunCurrent = 0.5, dryRunPowerFactor = 0.6, minVoltage = 180.0, maxVoltage = 250.0;
+// Debouncing
+unsigned long lastStartPress = 0;
+unsigned long lastStopPress = 0;
+const unsigned long DEBOUNCE_DELAY = 200;
 
-// Timers for non-blocking operations
-unsigned long lastPzemRead = 0, lastFirebaseUpdate = 0, lastLcdUpdate = 0;
-uint8_t lcdScreen = 0; // For cycling through LCD screens
-
-// Button debouncing
-unsigned long lastDebounceTime = 0;
-#define DEBOUNCE_DELAY 50
-
-// NTP & Time
-const char* ntpServer = "pool.ntp.org";
-const long gmtOffset_sec = 19800; // India Standard Time (UTC +5:30)
-const int daylightOffset_sec = 0;
-
-// ## 5. FUNCTION PROTOTYPES ##
-//-----------------------------------------------------------------------------
-void connectToWiFi();
-void initFirebase();
-void firebaseStreamCallback(FirebaseStream data);
-void loadSettingsFromPreferences();
-void saveSettingToPreferences(String key, float value);
-void readPzemData();
-void controlPump(bool turnOn, String reason);
-void checkProtections();
-void handleManualControls();
-void updateLcdDisplay();
-void syncTimeToNTP();
-void handleSchedules(); // Placeholder for now
-void setupOTA();
-void updateFirebaseData();
-
-// ## SETUP ##
-//-----------------------------------------------------------------------------
 void setup() {
   Serial.begin(115200);
-  
   pinMode(RELAY_PIN, OUTPUT);
-  digitalWrite(RELAY_PIN, LOW);
-  pinMode(START_BUTTON_PIN, INPUT_PULLUP);
-  pinMode(STOP_BUTTON_PIN, INPUT_PULLUP);
+  pinMode(BTN_START_PIN, INPUT_PULLUP);
+  pinMode(BTN_STOP_PIN, INPUT_PULLUP);
+  pinMode(BUZZER_PIN, OUTPUT);
+
+  digitalWrite(RELAY_PIN, HIGH);   // Pump OFF
+  digitalWrite(BUZZER_PIN, LOW);
 
   lcd.init();
   lcd.backlight();
-  lcd.setCursor(0, 0);
-  lcd.print("Pumguard Init...");
-
-  loadSettingsFromPreferences();
-  connectToWiFi();
-
-  if (WiFi.status() == WL_CONNECTED) {
-    lcd.setCursor(0, 1);
-    lcd.print("WiFi Connected!");
-    initFirebase();
-    syncTimeToNTP();
-    setupOTA();
-  } else {
-    lcd.setCursor(0, 1);
-    lcd.print("Offline Mode");
-  }
-  
-  delay(1500);
   lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Smart Pump Ctrl");
+  lcd.setCursor(0, 1);
+  lcd.print("v5.0 Dual Param"); // Updated version
+  delay(2000);
+
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Dual Detection");
+  lcd.setCursor(0, 1);
+  lcd.print("Power + PF");
+  delay(2000);
+  
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Ready...");
+  lcd.setCursor(0, 1);
+  lcd.print("Press START");
+
+  Serial.println("══════════════════════════════════════");
+  Serial.println("SMART PUMP CONTROLLER v5.0 (Dual-Parameter)");
+  Serial.println("✓ Dry run detection using Power & Power Factor");
+  Serial.println("✓ Max Attempts: 30");
+  Serial.println("══════════════════════════════════════\n");
 }
 
-// ## MAIN LOOP ##
-//-----------------------------------------------------------------------------
 void loop() {
-  if (WiFi.status() == WL_CONNECTED) {
-    ArduinoOTA.handle();
+  handleButtons();
+
+  if (pumpRunning && !permanentLockout) {
+    checkDryRun();
   }
 
-  handleManualControls();
-
-  if (millis() - lastPzemRead > 2000) {
-    readPzemData();
-    checkProtections();
-    lastPzemRead = millis();
-  }
-
-  if (millis() - lastFirebaseUpdate > 10000) {
-    if (Firebase.ready()) updateFirebaseData();
-    lastFirebaseUpdate = millis();
-  }
-
-  if (millis() - lastLcdUpdate > 2000) { // Update LCD every 2 seconds
-    updateLcdDisplay();
-    lastLcdUpdate = millis();
+  if (millis() - lastUpdate >= UPDATE_INTERVAL) {
+    lastUpdate = millis();
+    updateDisplay();
   }
 }
 
-// ## FUNCTION DEFINITIONS ##
-//-----------------------------------------------------------------------------
+//----------------------------------------------------//
+// BUTTON HANDLING (Unchanged from original)
+//----------------------------------------------------//
+void handleButtons() {
+  bool startPressed = (digitalRead(BTN_START_PIN) == LOW);
+  bool stopPressed = (digitalRead(BTN_STOP_PIN) == LOW);
 
-void connectToWiFi() {
-  WiFiManager wm;
-  wm.setConfigPortalTimeout(180); // 3-minute timeout for setup portal
-  if (!wm.autoConnect("Pumguard-Setup")) {
-    Serial.println("Failed to connect and hit timeout");
-    ESP.restart();
+  // START
+  if (startPressed && (millis() - lastStartPress > DEBOUNCE_DELAY)) {
+    lastStartPress = millis();
+    if (permanentLockout) showLockoutMessage();
+    else startPump();
   }
-}
 
-void initFirebase() {
-  config.api_key = FIREBASE_API_KEY;
-  config.database_url = FIREBASE_DATABASE_URL;
-  auth.user.email = FIREBASE_USER_EMAIL;
-  auth.user.password = FIREBASE_USER_PASSWORD;
-  
-  Firebase.begin(&config, &auth);
-  Firebase.reconnectWiFi(true);
+  // STOP and RESET (Hold for 3s to reset)
+  if (stopPressed && (millis() - lastStopPress > DEBOUNCE_DELAY)) {
+    unsigned long pressStart = millis();
+    lastStopPress = millis();
 
-  // Listen for changes in commands and settings
-  if (!Firebase.beginStream(fbdo, "/")) {
-    Serial.println("Stream setup failed: " + fbdo.errorReason());
-  }
-  Firebase.setStreamCallback(fbdo, firebaseStreamCallback, 1000);
-
-  // Set online status
-  Firebase.RTDB.setBool(&fbdo, "/pump_data/is_online", true);
-  Firebase.RTDB.onDisconnectSetBool(&fbdo, "/pump_data/is_online", false);
-}
-
-void firebaseStreamCallback(FirebaseStream data) {
-  // Handle remote pump control
-  if (data.dataPath() == "/commands/pump_control" && data.dataTypeEnum() == fb_esp_data_type_boolean) {
-    if (data.boolData() != pumpStatus) {
-      controlPump(data.boolData(), "Remote");
+    while (digitalRead(BTN_STOP_PIN) == LOW) {
+      if (millis() - pressStart > 3000) {
+        resetSystem();
+        while (digitalRead(BTN_STOP_PIN) == LOW) delay(10);
+        return;
+      }
+      delay(10);
     }
+
+    stopPump(false);
   }
+}
 
-  // Handle settings updates from Firebase
-  if (data.dataPath() == "/settings/dry_run_sensitivity" && data.dataTypeEnum() == fb_esp_data_type_float) {
-      dryRunCurrent = data.floatData();
-      saveSettingToPreferences("dry_curr", dryRunCurrent);
-      Serial.printf("Updated Dry Run Current to: %.2f\n", dryRunCurrent);
+
+//----------------------------------------------------//
+// START / STOP CONTROL
+//----------------------------------------------------//
+void startPump() {
+  if (!pumpRunning && !permanentLockout) {
+    digitalWrite(RELAY_PIN, LOW); // Turn relay ON
+    pumpRunning = true;
+    pumpStartTime = millis();
+    
+    // Reset adaptive parameters for this new run
+    refPower = 0.0;
+    refPF = 0.0;
+    dryRunDetectTime = 0;
+    lastPowerRatio = 1.0;
+    lastPfRatio = 1.0;
+
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("PUMP STARTED");
+    lcd.setCursor(0, 1);
+    lcd.print("Stabilizing...");
+    Serial.println("\n▶ PUMP STARTED - Waiting for system to stabilize...");
+    delay(1500);
   }
-  // Add similar 'if' blocks for your other settings like overload_current, etc.
 }
 
-void loadSettingsFromPreferences() {
-  preferences.begin("pumguard", true); // Read-only mode
-  overloadCurrent = preferences.getFloat("ovl_curr", 10.0);
-  dryRunCurrent = preferences.getFloat("dry_curr", 0.5);
-  dryRunPowerFactor = preferences.getFloat("dry_pf", 0.6);
-  minVoltage = preferences.getFloat("min_volt", 180.0);
-  maxVoltage = preferences.getFloat("max_volt", 250.0);
-  preferences.end();
-  Serial.println("Loaded settings from memory.");
+void stopPump(bool isDryRun) {
+  if (pumpRunning) {
+    digitalWrite(RELAY_PIN, HIGH); // Turn relay OFF
+    pumpRunning = false;
+
+    if (isDryRun) {
+      Serial.println("⚠ Pump stopped: Dry run detected!");
+    } else {
+      Serial.println("■ Pump stopped: Manual");
+    }
+
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("PUMP STOPPED");
+    lcd.setCursor(0, 1);
+    lcd.print(isDryRun ? "Dry Run!" : "Manual Stop");
+    delay(1500);
+  }
 }
 
-void saveSettingToPreferences(String key, float value) {
-  preferences.begin("pumguard", false); // Read-write mode
-  preferences.putFloat(key.c_str(), value);
-  preferences.end();
-}
-
-void readPzemData() {
-  float v = pzem.voltage();
-  if(!isnan(v)) voltage = v; else voltage = 0.0;
+//----------------------------------------------------//
+// DUAL-PARAMETER DRY RUN DETECTION (Power + PF)
+//----------------------------------------------------//
+void checkDryRun() {
+  unsigned long runDuration = millis() - pumpStartTime;
   
-  float i = pzem.current();
-  if(!isnan(i)) current = i; else current = 0.0;
-  
-  float p = pzem.power();
-  if(!isnan(p)) power = p; else power = 0.0;
-  
+  // Get fresh readings from PZEM sensor
+  float voltage = pzem.voltage();
+  float current = pzem.current();
+  float power = pzem.power();
   float pf = pzem.pf();
-  if(!isnan(pf)) powerFactor = pf; else powerFactor = 0.0;
-}
 
-void controlPump(bool turnOn, String reason) {
-  if (pumpStatus == turnOn) return; // No change needed
+  // Check for invalid readings from the sensor
+  if (isnan(voltage) || isnan(current) || isnan(power) || isnan(pf) || power < 10.0) {
+    return;
+  }
 
-  pumpStatus = turnOn;
-  digitalWrite(RELAY_PIN, pumpStatus);
-  Serial.printf("Pump turned %s. Reason: %s\n", turnOn ? "ON" : "OFF", reason.c_str());
+  // STEP 1: Establish a baseline after the initial stabilization period
+  if (runDuration >= STABILIZATION_DELAY && refPower == 0.0) {
+    // NEW: Sanity check before setting the baseline.
+    // If initial power is below our known minimum for a healthy run, trigger immediately.
+    if (power < MIN_NORMAL_POWER) {
+        Serial.println("------------------------------------------");
+        Serial.println("! ERROR: Initial power is too low!");
+        Serial.print("  > Power: "); Serial.print(power, 1); Serial.print("W is below minimum of "); Serial.println(MIN_NORMAL_POWER, 1);
+        Serial.println("  > Assuming start in a DRY RUN condition.");
+        Serial.println("------------------------------------------");
+        handleDryRunEvent(power, pf); // Trigger dry run immediately
+        return; // Exit the function to prevent setting a bad baseline
+    }
 
-  if (!turnOn) { // If turning off due to a fault
-    faultReason = reason;
-  } else { // If turning on, clear any previous fault
-    faultReason = "None";
-    // Also clear alert flags in Firebase
-    if (Firebase.ready()) {
-       Firebase.RTDB.setBool(&fbdo, "/pump_data/dry_run_alert", false);
-       // Clear other alerts...
+    // If the power is normal, proceed to set the baseline
+    refPower = power;
+    refPF = pf;
+    Serial.println("------------------------------------------");
+    Serial.println("✓ System stabilized. Baseline captured.");
+    Serial.print("  > Reference Power: "); Serial.print(refPower, 1); Serial.println(" W");
+    Serial.print("  > Reference PF: "); Serial.println(refPF, 3);
+    Serial.println("------------------------------------------");
+
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("Baseline Set");
+    lcd.setCursor(0, 1);
+    lcd.print("Monitoring...");
+    delay(1500);
+  }
+
+  // STEP 2: Once a baseline is set, start monitoring for a dry run condition
+  if (refPower > 0.0) {
+    // Calculate current ratios for display/logging
+    lastPowerRatio = power / refPower;
+    lastPfRatio = pf / refPF;
+
+    // Check if BOTH power and power factor have dropped below their thresholds
+    bool isPowerLow = (power < refPower * POWER_DROP_THRESHOLD);
+    bool isPfLow = (pf < refPF * PF_DROP_THRESHOLD);
+
+    if (isPowerLow && isPfLow) {
+      // If a potential dry run is detected, start a confirmation timer
+      if (dryRunDetectTime == 0) {
+        dryRunDetectTime = millis();
+        Serial.println("! Potential dry run detected. Starting confirmation timer...");
+      }
+      
+      // If the condition persists for the confirmation duration, trigger a dry run event
+      if (millis() - dryRunDetectTime >= DRY_RUN_CONFIRM_TIME) {
+        handleDryRunEvent(power, pf);
+      }
+    } else {
+      // If conditions return to normal, reset the confirmation timer
+      dryRunDetectTime = 0;
     }
   }
-  updateFirebaseData(); // Send immediate update
 }
 
-void checkProtections() {
-  if (!pumpStatus) return;
 
-  if (voltage > 0 && (voltage < minVoltage || voltage > maxVoltage)) {
-    controlPump(false, "Trip: Voltage");
-  } else if (current > overloadCurrent) {
-    controlPump(false, "Trip: Overload");
-    if(Firebase.ready()) Firebase.RTDB.setBool(&fbdo, "/pump_data/overload_alert", true);
-  } else if (current < dryRunCurrent && powerFactor < dryRunPowerFactor && power > 5) { // power > 5 to avoid false trip at start/stop
-    controlPump(false, "Trip: Dry-Run");
-    if(Firebase.ready()) Firebase.RTDB.setBool(&fbdo, "/pump_data/dry_run_alert", true);
+//----------------------------------------------------//
+// HANDLE DRY RUN EVENT
+//----------------------------------------------------//
+void handleDryRunEvent(float currentPower, float currentPF) {
+  stopPump(true);
+  dryRunAttempts++;
+
+  Serial.println("══════════════════════════════════════");
+  Serial.println("‼ DRY RUN CONFIRMED (Dual-Parameter) ‼");
+  Serial.print("  > Power dropped to "); Serial.print(currentPower, 1); Serial.print("W ("); Serial.print(lastPowerRatio * 100, 0); Serial.println("%)");
+  Serial.print("  > PF dropped to "); Serial.print(currentPF, 2); Serial.print(" ("); Serial.print(lastPfRatio * 100, 0); Serial.println("%)");
+  Serial.print("  > Attempt "); Serial.print(dryRunAttempts); Serial.print("/"); Serial.println(MAX_DRY_RUN_ATTEMPTS);
+  Serial.println("══════════════════════════════════════");
+
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("DRY RUN ALERT!");
+  lcd.setCursor(0, 1);
+  lcd.print("Power & PF Low");
+  soundAlarm(4);
+  delay(2000);
+
+  if (dryRunAttempts >= MAX_DRY_RUN_ATTEMPTS) {
+    permanentLockout = true;
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("LOCKED OUT!");
+    lcd.setCursor(0, 1);
+    lcd.print("Hold STOP 3s");
+    Serial.println("🔒 PERMANENT LOCKOUT! Manual reset required.");
+    soundAlarm(6);
+  } else {
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("Check Water!");
+    lcd.setCursor(0, 1);
+    lcd.print("Press START");
   }
+
+  // Reset timers and references for the next run
+  dryRunDetectTime = 0;
+  refPower = 0.0;
+  refPF = 0.0;
 }
 
-void handleManualControls() {
-  if ((millis() - lastDebounceTime) > DEBOUNCE_DELAY) {
-    if (digitalRead(START_BUTTON_PIN) == LOW) {
-      controlPump(true, "Manual ON");
-      lastDebounceTime = millis();
-    }
-    if (digitalRead(STOP_BUTTON_PIN) == LOW) {
-      controlPump(false, "Manual OFF");
-      lastDebounceTime = millis();
-    }
+
+//----------------------------------------------------//
+// SYSTEM RESET
+//----------------------------------------------------//
+void resetSystem() {
+  dryRunAttempts = 0;
+  permanentLockout = false;
+  refPower = 0.0;
+  refPF = 0.0;
+  
+  if (pumpRunning) {
+    stopPump(false);
   }
+  
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("SYSTEM RESET");
+  lcd.setCursor(0, 1);
+  lcd.print("Counters Cleared");
+  soundAlarm(2);
+
+  Serial.println("\n✓ SYSTEM RESET COMPLETE");
+  delay(2000);
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Ready!");
+  lcd.setCursor(0, 1);
+  lcd.print("Press START");
 }
 
-void updateLcdDisplay() {
+//----------------------------------------------------//
+// DISPLAY + ALARM
+//----------------------------------------------------//
+void updateDisplay() {
+  float voltage = pzem.voltage();
+  float current = pzem.current();
+
   lcd.clear();
   lcd.setCursor(0, 0);
 
-  if (faultReason != "None" && !pumpStatus) {
-    lcd.print("FAULT:");
-    lcd.setCursor(0, 1);
-    lcd.print(faultReason);
+  if (permanentLockout) {
+    lcd.print("LOCKED! HoldSTOP");
+  } else if (pumpRunning) {
+    lcd.print("ON ");
+    unsigned long runtime = (millis() - pumpStartTime) / 1000;
+    int minutes = runtime / 60;
+    int seconds = runtime % 60;
+    char timeStr[6];
+    sprintf(timeStr, "%02d:%02d", minutes, seconds);
+    lcd.print(timeStr);
+    
+    // Show power ratio as a health indicator
+    lcd.print(" P:");
+    lcd.print((int)(lastPowerRatio * 100));
+    lcd.print("%");
+    
   } else {
-      if (lcdScreen == 0) {
-        lcd.printf("V:%.1fV I:%.2fA", voltage, current);
-        lcd.setCursor(0, 1);
-        lcd.printf("PUMP IS %s", pumpStatus ? "ON" : "OFF");
-      } else if (lcdScreen == 1) {
-        lcd.printf("Pwr:%.0fW", power);
-        lcd.setCursor(0, 1);
-        lcd.printf("PF: %.2f", powerFactor);
-      }
-      lcdScreen = !lcdScreen; // Toggle between screens
+    lcd.print("OFF Try:");
+    lcd.print(dryRunAttempts);
+    lcd.print("/");
+    lcd.print(MAX_DRY_RUN_ATTEMPTS);
   }
-}
 
-void syncTimeToNTP(){
-  configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
-  Serial.println("Time synchronized");
-}
-
-void updateFirebaseData() {
-  FirebaseJson jsonData;
-  jsonData.set("pump_status", pumpStatus);
-  jsonData.set("current", String(current, 2));
-  jsonData.set("voltage", String(voltage, 1));
-  jsonData.set("power", String(power, 0));
-  jsonData.set("power_factor", String(powerFactor, 2));
-  jsonData.set("last_operation", faultReason == "None" ? "Normal" : faultReason);
+  lcd.setCursor(0, 1);
+  if (isnan(voltage) || isnan(current)){
+     lcd.print("V:--- I:--.--");
+  } else {
+    lcd.print("V:");
+    lcd.print(voltage, 0);
+    lcd.print(" I:");
+    lcd.print(current, 2);
+  }
   
-  String path = "/pump_data";
-  if (Firebase.RTDB.setJSON(&fbdo, path.c_str(), &jsonData)) {
-    //Serial.println("Firebase updated.");
-  } else {
-    Serial.println("Firebase update failed: " + fbdo.errorReason());
+  // More detailed Serial log (only log if not locked out to avoid spam)
+  if(!permanentLockout && pumpRunning) {
+    float power = pzem.power();
+    float pf = pzem.pf();
+    Serial.println("──────────────────────────────────────");
+    Serial.print("Status: "); Serial.println("🟢 RUNNING");
+    Serial.print("Voltage: "); Serial.print(voltage, 1); Serial.println(" V");
+    Serial.print("Current: "); Serial.print(current, 3); Serial.println(" A");
+    Serial.print("Power: "); Serial.print(power, 1); Serial.println(" W");
+    Serial.print("Power Factor: "); Serial.println(pf, 3);
+    if(refPower > 0) {
+       Serial.print("Power Ratio: "); Serial.print(lastPowerRatio * 100, 1); Serial.println("%");
+       Serial.print("PF Ratio: "); Serial.print(lastPfRatio * 100, 1); Serial.println("%");
+    }
+    Serial.print("Attempts: "); Serial.print(dryRunAttempts); Serial.print("/"); Serial.println(MAX_DRY_RUN_ATTEMPTS);
+    Serial.println("──────────────────────────────────────\n");
   }
 }
 
-
-void setupOTA() {
-  ArduinoOTA.setHostname("Pumguard-ESP32");
-  ArduinoOTA
-    .onStart([]() {
-      String type;
-      if (ArduinoOTA.getCommand() == U_FLASH) type = "sketch";
-      else type = "filesystem";
-      Serial.println("Start updating " + type);
-      lcd.clear();
-      lcd.print("OTA Update...");
-    })
-    .onEnd([]() {
-      Serial.println("\nEnd");
-      lcd.clear();
-      lcd.print("Update Complete!");
-      delay(1000);
-    })
-    .onProgress([](unsigned int progress, unsigned int total) {
-      Serial.printf("Progress: %u%%\r", (progress / (total / 100)));
-      lcd.setCursor(0,1);
-      lcd.printf("Progress: %u%%", (progress / (total / 100)));
-    })
-    .onError([](ota_error_t error) {
-      Serial.printf("Error[%u]: ", error);
-      if (error == OTA_AUTH_ERROR) Serial.println("Auth Failed");
-      else if (error == OTA_BEGIN_ERROR) Serial.println("Begin Failed");
-      else if (error == OTA_CONNECT_ERROR) Serial.println("Connect Failed");
-      else if (error == OTA_RECEIVE_ERROR) Serial.println("Receive Failed");
-      else if (error == OTA_END_ERROR) Serial.println("End Failed");
-      ESP.restart();
-    });
-  ArduinoOTA.begin();
-  Serial.println("OTA Ready");
+void showLockoutMessage() {
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("LOCKED OUT!");
+  lcd.setCursor(0, 1);
+  lcd.print("Hold STOP 3s");
+  soundAlarm(2);
+  delay(2000);
 }
+
+void soundAlarm(int beeps) {
+  for (int i = 0; i < beeps; i++) {
+    digitalWrite(BUZZER_PIN, HIGH);
+    delay(150);
+    digitalWrite(BUZZER_PIN, LOW);
+    delay(150);
+  }
+}
+
